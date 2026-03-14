@@ -1,0 +1,70 @@
+name: Bug report
+description: Report a bug in a Terraform module, construct library, or CI pipeline
+labels: ["bug"]
+
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      options:
+        - "Module: networking"
+        - "Module: database/postgres"
+        - "Module: compute/aks"
+        - "Module: governance"
+        - "Construct library: Python"
+        - "Construct library: TypeScript"
+        - "Construct library: C#"
+        - "Construct library: Java"
+        - "Construct library: Go"
+        - "Pipeline: tf-validate"
+        - "Pipeline: tf-plan"
+        - "Pipeline: tf-deploy"
+        - "Pipeline: tf-drift"
+        - "OPA policy"
+        - "Other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: describe
+    attributes:
+      label: Describe the bug
+      description: A clear description of what is wrong.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What should have happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: |
+        Include the stack code, plan output, or error message that demonstrates the issue.
+      placeholder: |
+        1. Stack with DatabaseConstruct, ha_enabled=True, environment=prod
+        2. Run cdktf synth
+        3. Plan shows ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Package / module version
+      placeholder: "e.g. k1cka5h-infra==1.4.0 / terraform-modules v1.4.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Pipeline job URL, state file path, or any other relevant information.
