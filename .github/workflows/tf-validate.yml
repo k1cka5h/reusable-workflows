@@ -1,0 +1,49 @@
+name: Terraform Validate
+
+# Reusable workflow — call with:
+#   uses: k1cka5h/reusable-workflows/.github/workflows/tf-validate.yml@main
+#   secrets:
+#     tf_modules_deploy_key: ${{ secrets.TF_MODULES_DEPLOY_KEY }}
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: "Directory containing the Terraform root module."
+        type: string
+        default: shared
+      terraform_version:
+        description: "Terraform CLI version."
+        type: string
+        default: "1.7.5"
+    secrets:
+      tf_modules_deploy_key:
+        description: "Read-only SSH deploy key for the private Terraform module repo."
+        required: true
+
+jobs:
+  validate:
+    name: Validate & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      # Loads the deploy key so `terraform init -backend=false` can resolve
+      # module sources from the private git repo without hitting the network
+      # for a real init — providers are fetched, modules are resolved.
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.tf_modules_deploy_key }}
+
+      - name: Format check
+        run: terraform fmt -check -recursive
+
+      - name: Init (no backend)
+        run: terraform -chdir=${{ inputs.working_directory }} init -backend=false
+
+      - name: Validate
+        run: terraform -chdir=${{ inputs.working_directory }} validate

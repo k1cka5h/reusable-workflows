@@ -1,0 +1,148 @@
+name: Terraform Deploy
+
+# Reusable workflow — call with:
+#   uses: k1cka5h/reusable-workflows/.github/workflows/tf-deploy.yml@main
+#   with:
+#     environment:    prod
+#     var_file:       prod/terraform.tfvars
+#     backend_config: prod/backend.hcl
+#   secrets:
+#     azure_client_id:       ${{ secrets.PROD_AZURE_CLIENT_ID }}
+#     azure_subscription_id: ${{ secrets.PROD_AZURE_SUBSCRIPTION_ID }}
+#     azure_tenant_id:       ${{ vars.AZURE_TENANT_ID }}
+#     tf_modules_deploy_key: ${{ secrets.TF_MODULES_DEPLOY_KEY }}
+#     tf_var_db_password:    ${{ secrets.DB_ADMIN_PASSWORD }}
+#     tf_var_log_workspace:  ${{ secrets.LOG_WORKSPACE_ID }}
+#
+# NOTE: Approval gates cannot live inside a reusable workflow — GitHub evaluates
+# environment protection rules against the repo that DEFINES the workflow, not the
+# calling repo. Add a gate job in the calling workflow before this job:
+#
+#   gate-prod:
+#     needs: deploy-stage
+#     environment: prod          # ← approval gate evaluated in YOUR repo
+#     runs-on: ubuntu-latest
+#     steps:
+#       - run: echo "Approved"
+#
+#   deploy-prod:
+#     needs: gate-prod
+#     uses: k1cka5h/reusable-workflows/.github/workflows/tf-deploy.yml@main
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Environment name used in artifact naming and policy check data."
+        type: string
+        required: true
+      working_directory:
+        description: "Directory containing the Terraform root module."
+        type: string
+        default: shared
+      var_file:
+        description: "Path to the .tfvars file, relative to the repo root."
+        type: string
+        required: true
+      backend_config:
+        description: "Path to the backend.hcl file, relative to the repo root."
+        type: string
+        required: true
+      policy_dir:
+        description: "Path to the OPA policy directory."
+        type: string
+        default: policy/
+      plan_artifact_retention_days:
+        description: "Days to retain the tfplan artifact. Use longer values for prod."
+        type: number
+        default: 30
+      terraform_version:
+        description: "Terraform CLI version."
+        type: string
+        default: "1.7.5"
+      conftest_version:
+        description: "Conftest version for OPA policy checks."
+        type: string
+        default: "0.51.0"
+    secrets:
+      azure_client_id:
+        description: "Azure service principal client ID for this environment."
+        required: true
+      azure_subscription_id:
+        description: "Azure subscription ID for this environment."
+        required: true
+      azure_tenant_id:
+        description: "Azure AD tenant ID."
+        required: true
+      tf_modules_deploy_key:
+        description: "Read-only SSH deploy key for the private Terraform module repo."
+        required: true
+      tf_var_db_password:
+        description: "Passed as TF_VAR_administrator_password. Optional."
+        required: false
+      tf_var_log_workspace:
+        description: "Passed as TF_VAR_log_analytics_workspace_id. Optional."
+        required: false
+
+jobs:
+  deploy:
+    name: Deploy / ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    env:
+      ARM_CLIENT_ID:       ${{ secrets.azure_client_id }}
+      ARM_TENANT_ID:       ${{ secrets.azure_tenant_id }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.azure_subscription_id }}
+      ARM_USE_OIDC:        "true"
+      TF_IN_AUTOMATION:    "true"
+      TF_INPUT:            "false"
+      TF_VAR_administrator_password:     ${{ secrets.tf_var_db_password }}
+      TF_VAR_log_analytics_workspace_id: ${{ secrets.tf_var_log_workspace }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.tf_modules_deploy_key }}
+
+      - name: Init
+        run: |
+          terraform -chdir=${{ inputs.working_directory }} init \
+            -backend-config=../${{ inputs.backend_config }}
+
+      # Re-plan immediately before apply. The plan from the PR review may be
+      # stale if state changed since the PR was opened.
+      - name: Plan
+        run: |
+          terraform -chdir=${{ inputs.working_directory }} plan \
+            -var-file=../${{ inputs.var_file }} \
+            -out=tfplan
+
+      - name: Install conftest
+        run: |
+          curl -sLo conftest.tar.gz \
+            "https://github.com/open-policy-agent/conftest/releases/download/v${{ inputs.conftest_version }}/conftest_${{ inputs.conftest_version }}_Linux_x86_64.tar.gz"
+          tar -xzf conftest.tar.gz conftest
+          sudo mv conftest /usr/local/bin/
+
+      - name: Policy check
+        run: |
+          terraform -chdir=${{ inputs.working_directory }} show -json tfplan > tfplan.json
+          conftest test tfplan.json \
+            --policy ${{ inputs.policy_dir }} \
+            --data <(printf '{"environment":"%s"}' "${{ inputs.environment }}") \
+            --output github
+
+      - name: Apply
+        run: terraform -chdir=${{ inputs.working_directory }} apply -auto-approve tfplan
+
+      - name: Upload plan artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}-${{ github.sha }}
+          path: ${{ inputs.working_directory }}/tfplan
+          retention-days: ${{ inputs.plan_artifact_retention_days }}

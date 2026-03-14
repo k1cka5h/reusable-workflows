@@ -1,0 +1,171 @@
+name: Terraform Drift Detection
+
+# Reusable workflow — call on a schedule from each product repo:
+#
+#   on:
+#     schedule:
+#       - cron: '0 3 * * *'   # daily at 03:00 UTC
+#
+#   jobs:
+#     drift-prod:
+#       if: github.event_name == 'schedule'
+#       uses: k1cka5h/reusable-workflows/.github/workflows/tf-drift.yml@v1.0.0
+#       with:
+#         environment:    prod
+#         var_file:       prod/terraform.tfvars
+#         backend_config: prod/backend.hcl
+#       secrets:
+#         azure_client_id:       ${{ secrets.PROD_AZURE_CLIENT_ID }}
+#         azure_subscription_id: ${{ secrets.PROD_AZURE_SUBSCRIPTION_ID }}
+#         azure_tenant_id:       ${{ vars.AZURE_TENANT_ID }}
+#         tf_modules_deploy_key: ${{ secrets.TF_MODULES_DEPLOY_KEY }}
+#
+# On drift detected: opens a GitHub issue titled "Drift detected in <env>"
+# labelled `drift` so the platform team can triage it.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Environment to check for drift (dev/qa/stage/prod)."
+        type: string
+        required: true
+      working_directory:
+        description: "Directory containing the Terraform root module."
+        type: string
+        default: shared
+      var_file:
+        description: "Path to the .tfvars file, relative to the repo root."
+        type: string
+        required: true
+      backend_config:
+        description: "Path to the backend.hcl file, relative to the repo root."
+        type: string
+        required: true
+      terraform_version:
+        description: "Terraform CLI version."
+        type: string
+        default: "1.7.5"
+    secrets:
+      azure_client_id:
+        description: "Azure service principal client ID for this environment."
+        required: true
+      azure_subscription_id:
+        description: "Azure subscription ID for this environment."
+        required: true
+      azure_tenant_id:
+        description: "Azure AD tenant ID."
+        required: true
+      tf_modules_deploy_key:
+        description: "Read-only SSH deploy key for the private Terraform module repo."
+        required: true
+      tf_var_db_password:
+        description: "Passed as TF_VAR_administrator_password. Optional."
+        required: false
+      tf_var_log_workspace:
+        description: "Passed as TF_VAR_log_analytics_workspace_id. Optional."
+        required: false
+
+jobs:
+  drift:
+    name: Drift check / ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      issues: write       # open drift issues
+    env:
+      ARM_CLIENT_ID:       ${{ secrets.azure_client_id }}
+      ARM_TENANT_ID:       ${{ secrets.azure_tenant_id }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.azure_subscription_id }}
+      ARM_USE_OIDC:        "true"
+      TF_IN_AUTOMATION:    "true"
+      TF_INPUT:            "false"
+      TF_VAR_administrator_password:     ${{ secrets.tf_var_db_password }}
+      TF_VAR_log_analytics_workspace_id: ${{ secrets.tf_var_log_workspace }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.tf_modules_deploy_key }}
+
+      - name: Init
+        run: |
+          terraform -chdir=${{ inputs.working_directory }} init \
+            -backend-config=../${{ inputs.backend_config }}
+
+      - name: Plan (drift check)
+        id: plan
+        # Exit codes:
+        #   0 = no changes (infrastructure matches state)
+        #   1 = error
+        #   2 = changes detected (drift)
+        run: |
+          terraform -chdir=${{ inputs.working_directory }} plan \
+            -var-file=../${{ inputs.var_file }} \
+            -detailed-exitcode \
+            -out=tfplan \
+            2>&1 | tee plan.txt
+
+          PLAN_EXIT=${PIPESTATUS[0]}
+          echo "exit_code=${PLAN_EXIT}" >> "$GITHUB_OUTPUT"
+
+          if [ "${PLAN_EXIT}" == "2" ]; then
+            echo "DRIFT_DETECTED=true"  >> "$GITHUB_OUTPUT"
+            echo "::warning::Drift detected in ${{ inputs.environment }}"
+          elif [ "${PLAN_EXIT}" == "1" ]; then
+            echo "Plan failed — check credentials and backend config"
+            exit 1
+          fi
+        continue-on-error: true
+
+      - name: Open drift issue
+        if: steps.plan.outputs.DRIFT_DETECTED == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs   = require('fs');
+            const plan = fs.readFileSync('plan.txt', 'utf8');
+            const body = plan.length > 50000
+              ? plan.slice(0, 50000) + '\n\n_Output truncated — see full plan in workflow logs._'
+              : plan;
+
+            const title = `Drift detected in \`${{ inputs.environment }}\` (${new Date().toISOString().slice(0,10)})`;
+
+            // Check for an existing open drift issue to avoid duplicates
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              state: 'open',
+              labels: 'drift,${{ inputs.environment }}',
+            });
+
+            if (issues.length > 0) {
+              // Add a comment to the existing issue instead of opening a new one
+              await github.rest.issues.createComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                issue_number: issues[0].number,
+                body: `## Drift still present — ${new Date().toISOString()}\n\`\`\`hcl\n${body}\n\`\`\`\n\n[Workflow run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner:  context.repo.owner,
+                repo:   context.repo.repo,
+                title:  title,
+                labels: ['drift', '${{ inputs.environment }}'],
+                body: `## Terraform drift detected in \`${{ inputs.environment }}\`\n\nThe scheduled drift check found that the actual Azure state differs from the Terraform state. Review the plan below and either:\n- Apply the corrective plan to bring Azure back in line with state, **or**\n- Update the Terraform configuration to reflect intentional changes.\n\n**Do not leave drift unresolved.** It compounds across plan cycles.\n\n\`\`\`hcl\n${body}\n\`\`\`\n\n[Workflow run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+              });
+            }
+
+      - name: Fail if drift detected
+        if: steps.plan.outputs.DRIFT_DETECTED == 'true'
+        run: |
+          echo "Drift was detected in ${{ inputs.environment }}. See the GitHub issue for details."
+          exit 1

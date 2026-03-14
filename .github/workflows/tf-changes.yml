@@ -1,0 +1,79 @@
+name: Detect Terraform Changes
+
+# Reusable workflow — call with:
+#   uses: k1cka5h/reusable-workflows/.github/workflows/tf-changes.yml@main
+#   with:
+#     shared_paths: "shared/**\npolicy/**"   # optional overrides
+#
+# Outputs: shared, dev, qa, stage, prod — "true"/"false" strings.
+# Use in downstream job if conditions:
+#   if: needs.changes.outputs.shared == 'true' || needs.changes.outputs.dev == 'true'
+
+on:
+  workflow_call:
+    inputs:
+      shared_paths:
+        description: "Newline-separated glob patterns that affect all environments."
+        type: string
+        default: |
+          shared/**
+          policy/**
+      dev_paths:
+        description: "Glob patterns for the dev environment folder."
+        type: string
+        default: "dev/**"
+      qa_paths:
+        description: "Glob patterns for the qa environment folder."
+        type: string
+        default: "qa/**"
+      stage_paths:
+        description: "Glob patterns for the stage environment folder."
+        type: string
+        default: "stage/**"
+      prod_paths:
+        description: "Glob patterns for the prod environment folder."
+        type: string
+        default: "prod/**"
+    outputs:
+      shared:
+        description: "'true' if shared or policy files changed."
+        value: ${{ jobs.detect.outputs.shared }}
+      dev:
+        description: "'true' if dev/ files changed."
+        value: ${{ jobs.detect.outputs.dev }}
+      qa:
+        description: "'true' if qa/ files changed."
+        value: ${{ jobs.detect.outputs.qa }}
+      stage:
+        description: "'true' if stage/ files changed."
+        value: ${{ jobs.detect.outputs.stage }}
+      prod:
+        description: "'true' if prod/ files changed."
+        value: ${{ jobs.detect.outputs.prod }}
+
+jobs:
+  detect:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      shared: ${{ steps.filter.outputs.shared }}
+      dev:    ${{ steps.filter.outputs.dev }}
+      qa:     ${{ steps.filter.outputs.qa }}
+      stage:  ${{ steps.filter.outputs.stage }}
+      prod:   ${{ steps.filter.outputs.prod }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            shared:
+              - ${{ inputs.shared_paths }}
+            dev:
+              - ${{ inputs.dev_paths }}
+            qa:
+              - ${{ inputs.qa_paths }}
+            stage:
+              - ${{ inputs.stage_paths }}
+            prod:
+              - ${{ inputs.prod_paths }}
